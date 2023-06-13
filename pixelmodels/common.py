@@ -3,6 +3,9 @@ import datetime
 import os
 import shutil
 
+import multiprocessing as mp
+from multiprocessing.pool import ThreadPool
+
 from quat.ff.probe import ffprobe
 from quat.ff.convert import (
     crop_video,
@@ -18,6 +21,7 @@ from quat.visual.base_features import *
 from quat.visual.fullref import *
 from quat.visual.image import *
 
+import ffmpeg
 
 MODEL_BASE_PATH = os.path.abspath(os.path.dirname(__file__) + "/models")
 CENTER_CROP = 360  # default is 360
@@ -208,14 +212,14 @@ def extract_mode0_features(video):
     - resolution_norm: float, resolution normalized by UHD-1/4K resolution
     """
     # use ffprobe to extract bitstream features
-    meta = ffprobe(video)
+    meta = ffmpeg.probe(video)#ffprobe(video)
     # mode0 base data
     mode0_features = {  # numbers are important here
-        "framerate": float(meta["avg_frame_rate"]),
-        "bitrate": float(meta["bitrate"]) / 1024,  # kbit/s
-        "bitdepth": 8 if meta["bits_per_raw_sample"] == "unknown" else int(meta["bits_per_raw_sample"]),
+        "framerate": float(meta["streams"][0]["avg_frame_rate"]),
+        "bitrate": float(meta["streams"][0]["bit_rate"]) / 1024,  # kbit/s
+        "bitdepth": 8 if meta["streams"][0]["bits_per_raw_sample"] == "unknown" else int(meta["bits_per_raw_sample"]),
         "codec": unify_video_codec(meta["codec"]),
-        "resolution": int(meta["height"]) * int(meta["width"]),
+        "resolution": int(meta["streams"][0]["height"]) * int(meta["streams"][0]["width"]),
     }
     # mode0 extended features
     mode0_features["bpp"] = 1024 * mode0_features["bitrate"] / (mode0_features["framerate"] * mode0_features["resolution"])
@@ -344,11 +348,13 @@ def extract_features_full_ref(dis_video, ref_video, temp_folder="./tmp", feature
         dis_basename = get_filename_without_extension(dis_video)
 
         # extract reference video properties
-        ffprobe_res = ffprobe(ref_video)
-        width = ffprobe_res["width"]
-        height = ffprobe_res["height"]
-        framerate = ffprobe_res["avg_frame_rate"]
-        pix_fmt = ffprobe_res["pix_fmt"]
+        #print(ref_video)
+        ffprobe_res = ffmpeg.probe(ref_video)#ffprobe(ref_video)
+        print(ffprobe_res)
+        width = ffprobe_res["streams"][0]["width"]
+        height = ffprobe_res["streams"][0]["height"]
+        framerate = ffprobe_res["streams"][0]["avg_frame_rate"]
+        pix_fmt = ffprobe_res["streams"][0]["pix_fmt"]
 
         lInfo(f"estimated src meta-data {width}x{height}@{framerate}:{pix_fmt}")
         dis_crop_folder = f"{temp_folder}/crop/{dis_basename}_dis/"
@@ -370,12 +376,62 @@ def extract_features_full_ref(dis_video, ref_video, temp_folder="./tmp", feature
             pix_fmt=pix_fmt,
             ccheight=CENTER_CROP
         )
+        #'''
+        def get_frames(video_filename):
+            frames = []
+            cap = cv2.VideoCapture(video_filename)
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if ret != True:
+                    break
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(rgb_frame)
 
-        for d_frame, r_frame in iterate_by_frame_two_videos(dis_video_avpvs_crop, ref_video_avpvs_crop, convert=False, openCV=True):
-            for f in features_to_calculate:
-                x = features[f].calc_dis_ref(d_frame, r_frame)
-                lInfo(f"handle frame {i} of {dis_video}: {f} -> {x}")
+            cap.release()
+            cv2.destroyAllWindows()
+
+            return frames
+
+        d_frames = get_frames(dis_video_avpvs_crop)
+        r_frames = get_frames(ref_video_avpvs_crop)
+        #'''
+        def func(features, f, d_frame, r_frame):
+            features[f].calc_dis_ref(d_frame, r_frame)
+
+        #'''
+        #for d_frame, r_frame in iterate_by_frame_two_videos(dis_video_avpvs_crop, ref_video_avpvs_crop, convert=False, openCV=True):
+        for d_frame, r_frame in zip(d_frames, r_frames):
+            pool = ThreadPool(processes=mp.cpu_count()//2)
+            starmap = [(features, f, d_frame, r_frame) for f in features_to_calculate]
+            pool.starmap_async(func, starmap)
+            pool.close()
+            pool.join()
+            #lInfo(f"Handled frame {i}....")
             i += 1
+
+        #'''
+        '''
+        for d_frame, r_frame in zip(d_frames, r_frames):
+            exe = ProcessPoolExecutor(max_workers=12)
+            for f in features_to_calculate:
+                exe.submit(features[f].calc_dis_ref, (d_frame, r_frame))
+            lInfo(f"Handled frame {i}....")
+            i += 1
+            exe.shutdown()
+        '''
+        '''
+        for d_frame, r_frame in iterate_by_frame_two_videos(dis_video_avpvs_crop, ref_video_avpvs_crop, convert=False, openCV=True):
+            pool = mp.Pool(processes=12)
+            for f in features_to_calculate:
+                pool.apply_async(features[f].calc_dis_ref, (d_frame, r_frame,))
+                #x = features[f].calc_dis_ref(d_frame, r_frame)
+                #lInfo(f"handle frame {i} of {dis_video}: {f} -> {x}")
+            pool.close()
+            lInfo(f"Handling frame {i}....")
+            pool.join()
+            lInfo(f"Handled frame {i}....")
+            i += 1
+        '''
 
         # remove temp files
         shutil.rmtree(dis_crop_folder)
